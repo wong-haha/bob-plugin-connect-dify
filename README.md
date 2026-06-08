@@ -1,3 +1,9 @@
+[简体中文](./README.md) | [English](./README_EN.md)
+
+![GitHub Repo stars](https://img.shields.io/github/stars/wong-haha/bob-plugin-connect-dify?style=social)
+![GitHub release](https://img.shields.io/github/v/release/wong-haha/bob-plugin-connect-dify)
+![GitHub all releases](https://img.shields.io/github/downloads/wong-haha/bob-plugin-connect-dify/total)
+
 # ConnectDify · Bob × Dify 工作流插件
 
 > 一个把 Bob 的划词 / OCR 能力接入 Dify 工作流的插件。选中文本，即可触发任意你在 Dify 中编排好的工作流（Chatflow / Workflow），让 Bob 拥有「无限可能」。
