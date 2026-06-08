@@ -1,0 +1,63 @@
+{
+  "identifier": "dify.0.7.0",
+  "version": "0.7.0",
+  "category": "translate",
+  "name": "ConnectDify",
+  "summary": "Connect to Dify Chatflow / Workflow.",
+  "author": "Wong",
+  "homepage": "",
+  "appcast": "",
+  "minBobVersion": "1.15.0",
+  "options": [
+    {
+      "identifier": "appType",
+      "type": "menu",
+      "title": "应用类型",
+      "defaultValue": "chatflow",
+      "menuValues": [
+        {
+          "title": "Chatflow",
+          "value": "chatflow"
+        },
+        {
+          "title": "Workflow",
+          "value": "workflow"
+        }
+      ],
+      "desc": "选择你在 Dify 中创建的应用类型。"
+    },
+    {
+      "identifier": "apiKey",
+      "type": "text",
+      "title": "API 密钥",
+      "defaultValue": "",
+      "textConfig": {
+        "type": "secure",
+        "placeholderText": "请输入您的 API 密钥"
+      },
+      "desc": "用于访问 Dify 的认证密钥，请确保填写正确。"
+    },
+    {
+      "identifier": "apiUrl",
+      "type": "text",
+      "title": "API 地址",
+      "defaultValue": "",
+      "textConfig": {
+        "type": "visible",
+        "placeholderText": "请输入请求地址，例如 http://localhost/v1/chat-messages"
+      },
+      "desc": "Chatflow 通常为 v1/chat-messages 结尾；Workflow 通常为 v1/workflows/run 结尾。"
+    },
+    {
+      "identifier": "inputKey",
+      "type": "text",
+      "title": "入参变量名（仅 Workflow）",
+      "defaultValue": "",
+      "textConfig": {
+        "type": "visible",
+        "placeholderText": "仅支持 Workflow String 字段类型的起始节点入参"
+      },
+      "desc": "仅 Workflow 模式需要填写，Chatflow 模式下此项无效。"
+    }
+  ]
+}
