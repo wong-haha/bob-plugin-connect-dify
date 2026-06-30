@@ -44,6 +44,41 @@ function parseStreamData(line) {
 }
 
 /**
+ * 消费一个 SSE 网络分片。
+ *
+ * 网络分片（chunk）的边界由网络栈决定，与 SSE 的换行无关，因此一条
+ * `data: {...}` 行完全可能被切成两半、分布在相邻两次回调里。这里用
+ * 跨回调的缓冲区 `ctx.buffer` 累积文本，只解析「以 \n 结尾的完整行」，
+ * 把最后那段可能不完整的尾巴留在缓冲区，等下一个分片来补全，从而避免
+ * 半行被 JSON.parse 丢弃导致的「丢行」。
+ */
+function consumeSseChunk(query, ctx, chunkText) {
+  ctx.buffer += chunkText || '';
+  let newlineIndex;
+  while ((newlineIndex = ctx.buffer.indexOf('\n')) !== -1) {
+    // 去掉结尾的 \r，兼容被代理规范化成 CRLF（\r\n）的 SSE 流
+    const line = ctx.buffer.slice(0, newlineIndex).replace(/\r$/, '');
+    ctx.buffer = ctx.buffer.slice(newlineIndex + 1);
+    const responseObj = parseStreamData(line);
+    if (responseObj) {
+      handleResponse(query, ctx, responseObj);
+    }
+  }
+}
+
+/**
+ * 流结束后，处理缓冲区里残留的最后一行（末尾可能没有 \n）。
+ */
+function flushSseBuffer(query, ctx) {
+  if (!ctx.buffer) return;
+  const responseObj = parseStreamData(ctx.buffer.replace(/\r$/, ''));
+  if (responseObj) {
+    handleResponse(query, ctx, responseObj);
+  }
+  ctx.buffer = '';
+}
+
+/**
  * 构建请求体
  */
 function buildRequestBody(text) {
@@ -224,7 +259,8 @@ function translate(query) {
     const ctx = {
       targetText: '',
       reasoningText: '',
-      hasReasoningField: false
+      hasReasoningField: false,
+      buffer: ''
     };
 
     await $http.streamRequest({
@@ -234,18 +270,14 @@ function translate(query) {
       body: body,
       cancelSignal: query.cancelSignal,
       streamHandler: (streamData) => {
-        const lines = streamData.text.split('\n');
-        lines.forEach(line => {
-          const responseObj = parseStreamData(line);
-          if (responseObj) {
-            handleResponse(query, ctx, responseObj);
-          }
-        });
+        consumeSseChunk(query, ctx, streamData.text);
       },
       handler: (result) => {
         if (result.error || result.response.statusCode >= 400) {
           handleError(query, result);
         } else {
+          // 收尾：处理缓冲区里残留的最后一行
+          flushSseBuffer(query, ctx);
           // 如果流式过程中没收到任何内容，给出友好提示
           if (!ctx.targetText) {
             ctx.targetText = "[未收到有效输出，请检查 Dify 应用配置]";
