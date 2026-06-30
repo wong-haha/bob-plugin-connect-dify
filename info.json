@@ -1,6 +1,6 @@
 {
   "identifier": "dify.0.7.0",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "category": "translate",
   "name": "ConnectDify",
   "summary": "Connect to Dify Chatflow / Workflow.",
