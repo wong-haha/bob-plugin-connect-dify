@@ -26,7 +26,7 @@ Its ceiling is the limit of your imagination in Dify.
 **Deep web research**:
 The Dify workflow triggers a web search on demand, then feeds the retrieved information to the LLM as context to answer / interpret the selected text.
 
-<img width="400" alt="The result shown inside Bob" src="https://github.com/user-attachments/assets/d7385a05-ce62-43e0-9145-3a33315db243" />
+<img width="400" alt="The result shown inside Bob" src="https://github.com/user-attachments/assets/09493c6e-e3e8-4d47-8b45-342cb88e6abb" />
 <img width="800" alt="The deep web-research workflow in Dify" src="https://github.com/user-attachments/assets/0abe6aea-163c-420c-b8bd-bf361f01934a" />
 
 **Read it later**:
