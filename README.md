@@ -26,7 +26,7 @@ ConnectDify 让 Bob 不再只是翻译工具。它把你选中的文字作为输
 **深度联网检索**：
 dify 工作流中按需启动关键词联网检索，再把检索后的信息作为上下文提供给 LLM 来回复/解读划词提交的内容
 
-<img width="400" alt="Bob界面呈现" src="https://github.com/user-attachments/assets/d7385a05-ce62-43e0-9145-3a33315db243" />
+<img width="400" alt="Bob界面呈现" src="https://github.com/user-attachments/assets/09493c6e-e3e8-4d47-8b45-342cb88e6abb" />
 <img width="800" alt="dify端深度联网检索工作流匹配" src="https://github.com/user-attachments/assets/0abe6aea-163c-420c-b8bd-bf361f01934a" />
 
 **稍后阅读**：
