@@ -2,27 +2,6 @@ function supportLanguages() {
   return ['auto', 'zh-Hans', 'en', 'zh-Hant', 'ja', 'ko', 'fr', 'pl', 'nl', 'ru', 'it', 'pt'];
 }
 
-const THINK_OPEN = '<think>';
-const THINK_CLOSE = '</think>';
-
-/**
- * 两次 onStream 之间的最小间隔（毫秒）。
- *
- * 每次 onStream 都要把「累计全文」跨 JS↔原生边界序列化一遍，逐 token 推送时
- * 总流量是 O(n²)；长回答（上万字）下这既拖慢 Bob 也放大失败面。节流后正文的
- * 最终完整性由 onCompletion 保证。
- */
-const STREAM_PUSH_INTERVAL_MS = 60;
-
-/**
- * 思考阶段的正文占位文案。
- *
- * 模型先输出一大段 <think> 时，正文要等思考结束才开始，中间若不推送任何内容，
- * Bob 窗口会长时间空白；若推送空正文，Bob 又会报「插件未返回有效结果」。
- * 用一句占位文案顶住，思考面板就能边生成边看，正文一到就被覆盖。
- */
-const THINKING_PLACEHOLDER = '思考中…';
-
 /**
  * 检查配置项是否完整
  */
@@ -43,33 +22,32 @@ function isWorkflowMode() {
 }
 
 /**
- * 配置响应超时时长
+ * 配置响应超时时长（秒）
  */
 function pluginTimeoutInterval() {
   return 180;
 }
 
 /**
- * 一次翻译请求的全部可变状态
+ * 创建单次翻译生命周期的上下文
  */
 function createContext() {
   return {
-    targetText: '',      // 已解析出的正文
-    reasoningText: '',   // 已解析出的思考内容
-    fallbackText: '',    // 兜底正文（来自 workflow_finished / node_finished）
-    buffer: '',          // SSE 行缓冲：跨网络分片拼完整行
-    tagBuffer: '',       // <think> 标签缓冲：跨事件拼完整标签
-    inThink: false,      // 当前是否处在 <think> ... </think> 之内
-    eventCount: 0,       // 收到的事件总数（用于诊断）
-    lastEvent: '',       // 最后一个事件名（用于诊断）
-    streamError: null,   // SSE 里的 error 事件
-    lastPushAt: 0,       // 上次 onStream 的时间戳
-    done: false          // onCompletion 是否已调用
+    targetText: '',        // 已解析出的正文（单调累积全文）
+    reasoningText: '',     // 独立推理字段累积的思考过程（如 agent_thought / reasoning_content）
+    hasReasoningField: false, // 是否由独立推理字段传入思考内容
+    fallbackText: '',      // 兜底正文（workflow_finished / node_finished）
+    buffer: '',            // SSE 行缓冲：跨网络分片拼装完整 data 行
+    lastPushAt: 0,         // 上一次调用 onStream 的时间戳
+    eventCount: 0,         // 累计收到的合法 SSE 事件数
+    lastEvent: '',         // 最后一个收到的事件名
+    streamError: null,     // 接口流中明确抛出的 error 内容
+    done: false            // 确保 onCompletion 仅触发一次
   };
 }
 
 /**
- * 解析流事件数据
+ * 解析单个 SSE 行的数据
  */
 function parseStreamData(line) {
   const dataMatch = line.match(/^data:\s*(.*)$/);
@@ -84,19 +62,13 @@ function parseStreamData(line) {
 }
 
 /**
- * 消费一个 SSE 网络分片。
- *
- * 网络分片（chunk）的边界由网络栈决定，与 SSE 的换行无关，因此一条
- * `data: {...}` 行完全可能被切成两半、分布在相邻两次回调里。这里用
- * 跨回调的缓冲区 `ctx.buffer` 累积文本，只解析「以 \n 结尾的完整行」，
- * 把最后那段可能不完整的尾巴留在缓冲区，等下一个分片来补全，从而避免
- * 半行被 JSON.parse 丢弃导致的「丢行」。
+ * 消费 SSE 网络分片，以 
+ 切割并保留未闭合的尾部在缓冲区
  */
 function consumeSseChunk(query, ctx, chunkText) {
   ctx.buffer += chunkText || '';
   let newlineIndex;
   while ((newlineIndex = ctx.buffer.indexOf('\n')) !== -1) {
-    // 去掉结尾的 \r，兼容被代理规范化成 CRLF（\r\n）的 SSE 流
     const line = ctx.buffer.slice(0, newlineIndex).replace(/\r$/, '');
     ctx.buffer = ctx.buffer.slice(newlineIndex + 1);
     const responseObj = parseStreamData(line);
@@ -107,7 +79,7 @@ function consumeSseChunk(query, ctx, chunkText) {
 }
 
 /**
- * 流结束后，处理缓冲区里残留的最后一行（末尾可能没有 \n）。
+ * 流结束收尾：处理缓冲区残留的最后一行
  */
 function flushSseBuffer(query, ctx) {
   if (!ctx.buffer) return;
@@ -117,94 +89,6 @@ function flushSseBuffer(query, ctx) {
   }
   ctx.buffer = '';
 }
-
-// ---------------------------------------------------------------------------
-// <think> 标签的增量拆分
-// ---------------------------------------------------------------------------
-
-/**
- * 返回 text 末尾「有可能是 tag 前缀」的长度。
- *
- * 例如 tag = "</think>"、text = "正文</thi" 时返回 5：末尾的 "</thi" 还不能
- * 下结论，得留到下个片段拼上再判断。若末尾完全不可能是标签前缀则返回 0，
- * 这部分文本就可以立刻输出。
- */
-function partialTagLength(text, tag) {
-  const max = Math.min(tag.length - 1, text.length);
-  for (let len = max; len > 0; len--) {
-    if (tag.startsWith(text.slice(text.length - len))) return len;
-  }
-  return 0;
-}
-
-/**
- * 按当前 inThink 状态，把一段纯文本归入正文或思考内容
- */
-function appendPlainText(ctx, text) {
-  if (!text) return;
-  if (ctx.inThink) {
-    ctx.reasoningText += text;
-  } else {
-    ctx.targetText += text;
-  }
-}
-
-/**
- * 增量消费一段 answer 文本，边走边把 <think> ... </think> 剥离到思考内容里。
- *
- * 之所以自己拆而不交给 Bob 的 `thinkInfo.splitThinkTag`：流式过程中 `</think>`
- * 还没到，Bob 拿到的是一段「未闭合的 <think>」，剥完之后正文为空，Bob 会判定
- * 插件没有返回有效结果。自己拆就能保证推给 Bob 的永远是「干净且非空的正文」。
- */
-function appendAnswerChunk(ctx, chunk) {
-  if (!chunk) return;
-  ctx.tagBuffer += chunk;
-
-  for (;;) {
-    const tag = ctx.inThink ? THINK_CLOSE : THINK_OPEN;
-    const index = ctx.tagBuffer.indexOf(tag);
-    if (index === -1) break;
-    appendPlainText(ctx, ctx.tagBuffer.slice(0, index));
-    ctx.tagBuffer = ctx.tagBuffer.slice(index + tag.length);
-    ctx.inThink = !ctx.inThink;
-  }
-
-  // 没有完整标签了：只把「确定不是标签前缀」的部分吐出去，尾巴留着等下一片
-  const tag = ctx.inThink ? THINK_CLOSE : THINK_OPEN;
-  const keep = partialTagLength(ctx.tagBuffer, tag);
-  if (keep < ctx.tagBuffer.length) {
-    appendPlainText(ctx, ctx.tagBuffer.slice(0, ctx.tagBuffer.length - keep));
-    ctx.tagBuffer = ctx.tagBuffer.slice(ctx.tagBuffer.length - keep);
-  }
-}
-
-/**
- * 流结束后把标签缓冲区里残留的尾巴（半个标签 / 未闭合内容）归位
- */
-function flushAnswerBuffer(ctx) {
-  if (!ctx.tagBuffer) return;
-  appendPlainText(ctx, ctx.tagBuffer);
-  ctx.tagBuffer = '';
-}
-
-/**
- * 重新解析一整段 answer（用于 message_replace 与兜底文本）
- */
-function reparseAnswer(ctx, text) {
-  ctx.targetText = '';
-  ctx.tagBuffer = '';
-  ctx.inThink = false;
-  const previousReasoning = ctx.reasoningText;
-  ctx.reasoningText = '';
-  appendAnswerChunk(ctx, text);
-  flushAnswerBuffer(ctx);
-  // 整段文本里没有 <think> 时，保留此前从 reasoning_content 字段收到的思考内容
-  if (!ctx.reasoningText) ctx.reasoningText = previousReasoning;
-}
-
-// ---------------------------------------------------------------------------
-// 请求与结果
-// ---------------------------------------------------------------------------
 
 /**
  * 构建请求体
@@ -219,7 +103,6 @@ function buildRequestBody(text, responseMode) {
       user: "bob-plugin-user"
     };
   }
-  // Chatflow 模式
   return {
     inputs: {},
     query: text,
@@ -231,56 +114,88 @@ function buildRequestBody(text, responseMode) {
 }
 
 /**
- * 组装交给 Bob 的 result 对象
+ * 构建符合 Bob 1.21.0 规范的 thinkInfo
+ * - 当存在独立推理字段时通过 content 传回
+ * - 否则开启 splitThinkTag 让 Bob 1.21.0 原生在 Markdown 渲染中自动分离 <think> 思考框
+ */
+function buildThinkInfo(ctx) {
+  if (ctx.hasReasoningField && ctx.reasoningText) {
+    return { content: ctx.reasoningText };
+  }
+  return { splitThinkTag: true };
+}
+
+/**
+ * 组装符合 Bob 1.21.0 标准的 translate result 对象
  */
 function buildResult(query, ctx) {
-  const result = { toParagraphs: [ctx.targetText] };
+  const result = {
+    content: {
+      format: 'markdown',
+      text: ctx.targetText
+    },
+    toParagraphs: [ctx.targetText],
+    thinkInfo: buildThinkInfo(ctx)
+  };
   if (query.detectFrom) result.from = query.detectFrom;
   if (query.detectTo) result.to = query.detectTo;
-  if (ctx.reasoningText) result.thinkInfo = { content: ctx.reasoningText };
   return result;
 }
 
 /**
- * 推送流式结果。
- *
- * 两条铁律：
- * 1. 交给 Bob 的正文永不为空——空结果会被 Bob 判为「插件未返回有效结果」。
- *    思考阶段正文天然是空的，此时用占位文案顶住，让思考面板能边生成边显示。
- * 2. 推送有节流，避免长回答把「累计全文」重复搬运上万次。
+ * 实时推送流式数据给 Bob（onStream）
+ * 遵循 Bob 1.21.0：每次推送累计的 Markdown 全文与思考配置
  */
 function pushStream(query, ctx) {
-  const hasBody = ctx.targetText.trim().length > 0;
-  if (!hasBody && !ctx.reasoningText) return;
+  if (!query || typeof query.onStream !== 'function') return;
+  if (!ctx.targetText && !ctx.reasoningText) return;
 
   const now = Date.now();
-  if (now - ctx.lastPushAt < STREAM_PUSH_INTERVAL_MS) return;
+  if (now - ctx.lastPushAt < 25) return;
   ctx.lastPushAt = now;
 
   const result = buildResult(query, ctx);
-  if (!hasBody) result.toParagraphs = [THINKING_PLACEHOLDER];
-  query.onStream({ result });
+  const streamPayload = Object.assign({ result: result }, result);
+  query.onStream(streamPayload);
 }
 
 /**
- * 处理 Chatflow 模式的响应事件
+ * 处理 Chatflow 模式事件
  */
 function handleChatflowEvent(query, ctx, responseObj) {
   const event = responseObj.event;
 
-  if (event === "message" || event === "agent_message") {
-    if (responseObj.reasoning_content) {
-      ctx.reasoningText += responseObj.reasoning_content;
+  // 1. Agent 思考过程
+  if (event === "agent_thought") {
+    const thought = responseObj.thought || "";
+    if (thought) {
+      ctx.reasoningText += thought;
+      ctx.hasReasoningField = true;
+      pushStream(query, ctx);
     }
-    appendAnswerChunk(ctx, responseObj.answer);
+    return;
+  }
+
+  // 2. 文本消息与带独立推理的消息
+  if (event === "message" || event === "agent_message") {
+    const reasoning = responseObj.reasoning_content || responseObj.thought;
+    if (reasoning) {
+      ctx.reasoningText += reasoning;
+      ctx.hasReasoningField = true;
+    }
+    if (responseObj.answer) {
+      ctx.targetText += responseObj.answer;
+    }
     pushStream(query, ctx);
     return;
   }
 
-  // 内容审查等场景下 Dify 会用一整段新文本替换已输出的回答
+  // 3. 内容审核或消息替换
   if (event === "message_replace") {
-    reparseAnswer(ctx, responseObj.answer || '');
-    pushStream(query, ctx);
+    if (responseObj.answer) {
+      ctx.targetText = responseObj.answer;
+      pushStream(query, ctx);
+    }
     return;
   }
 
@@ -290,14 +205,19 @@ function handleChatflowEvent(query, ctx, responseObj) {
 }
 
 /**
- * 处理 Workflow 模式的响应事件
- *
- * - text_chunk: 流式文本片段，data.text 为文本内容
- * - node_finished / workflow_finished: 只记录为兜底，不直接拼进正文
+ * 处理 Workflow 模式事件
  */
 function handleWorkflowEvent(query, ctx, responseObj) {
   if (responseObj.event === "text_chunk") {
-    appendAnswerChunk(ctx, responseObj.data && responseObj.data.text);
+    const data = responseObj.data || {};
+    const reasoning = data.reasoning_content || data.thought;
+    if (reasoning) {
+      ctx.reasoningText += reasoning;
+      ctx.hasReasoningField = true;
+    }
+    if (data.text) {
+      ctx.targetText += data.text;
+    }
     pushStream(query, ctx);
     return;
   }
@@ -308,14 +228,10 @@ function handleWorkflowEvent(query, ctx, responseObj) {
 }
 
 /**
- * 从 node_finished 事件里收集「兜底正文」。
- *
- * 注意这里只是**记录**而不是拼接：节点事件与 message / text_chunk 描述的是同一段
- * 内容，直接拼接会让正文翻倍。只有当流式过程完全没拿到正文时才会用上。
+ * 捕获节点完成事件中的兜底输出
  */
 function captureNodeFallback(ctx, responseObj) {
   const data = responseObj.data || {};
-
   const messages = data.process_data && data.process_data.messages;
   if (Array.isArray(messages)) {
     const assistantText = messages
@@ -329,32 +245,30 @@ function captureNodeFallback(ctx, responseObj) {
   if (outputs && typeof outputs === "object") {
     const outputText = extractTextFromOutputs(outputs);
     if (outputText) ctx.fallbackText = outputText;
-    if (outputs.reasoning_content && !ctx.reasoningText) {
-      ctx.reasoningText = outputs.reasoning_content;
+    const reasoning = outputs.reasoning_content || outputs.thought;
+    if (reasoning && !ctx.reasoningText) {
+      ctx.reasoningText = reasoning;
+      ctx.hasReasoningField = true;
     }
   }
 }
 
 /**
  * 从 outputs 对象中提取文本内容（兜底）
- * 优先取 answer/text/output/result 等常见 key，否则取第一个非空字符串
  */
 function extractTextFromOutputs(outputs) {
   if (!outputs || typeof outputs !== "object") return "";
-
   const commonKeys = ["answer", "text", "output", "result", "content", "response"];
   for (const key of commonKeys) {
     if (typeof outputs[key] === "string" && outputs[key].trim()) {
       return outputs[key];
     }
   }
-
   for (const key of Object.keys(outputs)) {
     if (typeof outputs[key] === "string" && outputs[key].trim()) {
       return outputs[key];
     }
   }
-
   return "";
 }
 
@@ -372,8 +286,6 @@ function handleResponse(query, ctx, responseObj) {
     return;
   }
 
-  // Chatflow / Workflow 都会以 workflow_finished 收尾，其 outputs 里带着完整回答，
-  // 是最可靠的兜底来源（正是 Dify 后台日志里看到的那段 JSON）。
   if (responseObj.event === "workflow_finished") {
     const outputText = extractTextFromOutputs(responseObj.data && responseObj.data.outputs);
     if (outputText) ctx.fallbackText = outputText;
@@ -388,7 +300,7 @@ function handleResponse(query, ctx, responseObj) {
 }
 
 /**
- * 把 HTTP 层 / 状态码错误翻译成 Bob 的 error 对象
+ * 将网络与 HTTP 状态码错误转化为 Bob 的 error 对象
  */
 function buildHttpError(result, statusCode) {
   if (statusCode >= 400) {
@@ -407,66 +319,44 @@ function buildHttpError(result, statusCode) {
 }
 
 /**
- * 根据当前 ctx 与 HTTP 结果，算出最终交给 Bob 的 completion 载荷
+ * 翻译生命周期完成回调（保证触发且仅触发一次）
  */
-function buildCompletionPayload(query, ctx, result) {
+function finish(query, ctx, result) {
+  if (ctx.done) return;
+  ctx.done = true;
+
   flushSseBuffer(query, ctx);
-  flushAnswerBuffer(ctx);
 
   const statusCode = (result && result.response && result.response.statusCode) || 0;
   if ((result && result.error) || statusCode >= 400) {
-    return { error: buildHttpError(result || {}, statusCode) };
+    query.onCompletion({ error: buildHttpError(result || {}, statusCode) });
+    return;
   }
 
   if (ctx.streamError) {
-    return { error: { type: 'api', message: `Dify 返回错误：${ctx.streamError}` } };
+    query.onCompletion({ error: { type: 'api', message: `Dify 返回错误：${ctx.streamError}` } });
+    return;
   }
 
-  // 流式没拿到正文时，用 workflow_finished / node_finished 里的完整回答兜底
   if (!ctx.targetText.trim() && ctx.fallbackText) {
-    reparseAnswer(ctx, ctx.fallbackText);
+    ctx.targetText = ctx.fallbackText;
   }
 
-  // 只拿到了思考内容（例如 <think> 始终没闭合）：把它当正文展示，总比报错好
   if (!ctx.targetText.trim() && ctx.reasoningText) {
     ctx.targetText = ctx.reasoningText;
     ctx.reasoningText = '';
   }
 
   if (!ctx.targetText.trim()) {
-    ctx.targetText = `[未解析到文本内容：共收到 ${ctx.eventCount} 个事件，最后一个事件为 ${ctx.lastEvent || '（无）'}。` +
-      `请检查 Dify 应用是否配置了输出节点（Chatflow 需要「直接回复」节点，Workflow 需要「结束」节点）]`;
+    ctx.targetText = `[未收到有效输出：请检查 Dify 应用配置]`;
   }
 
-  return { result: buildResult(query, ctx) };
+  const finalResult = buildResult(query, ctx);
+  query.onCompletion({ result: finalResult });
 }
 
 /**
- * 收尾：保证 onCompletion 恰好被调用一次，且一定带着可用的载荷。
- *
- * Bob 会在插件「没有调用 onCompletion」或「结果为空」时提示「插件未返回有效结果」，
- * 所以这里既做去重（done 标志），也做兜底（内部异常也要转成 error 返回）。
- */
-function finish(query, ctx, result) {
-  if (ctx.done) return;
-  ctx.done = true;
-
-  let payload;
-  try {
-    payload = buildCompletionPayload(query, ctx, result);
-  } catch (error) {
-    payload = {
-      error: {
-        type: 'unknown',
-        message: `插件内部错误：${(error && (error._message || error.message)) || error}`
-      }
-    };
-  }
-  query.onCompletion(payload);
-}
-
-/**
- * 主函数
+ * 主翻译函数
  */
 function translate(query) {
   const validationError = validateOptions();
@@ -477,15 +367,14 @@ function translate(query) {
   const headers = {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${$option.apiKey}`,
+    "Accept": "text/event-stream"
   };
 
   const body = buildRequestBody(query.text, "streaming");
   const ctx = createContext();
 
-  (async () => {
-    // $http.streamRequest 既会回调 handler，也会 resolve 出同一个结果。
-    // 两条路都接到 finish 上，哪条先到都能正常收尾（finish 自带去重）。
-    const result = await $http.streamRequest({
+  try {
+    $http.streamRequest({
       method: 'POST',
       url: $option.apiUrl,
       header: headers,
@@ -495,22 +384,20 @@ function translate(query) {
         try {
           consumeSseChunk(query, ctx, streamData && streamData.text);
         } catch (error) {
-          // 单个分片解析失败不应中断整条流，收尾时还有兜底路径
+          // 单个分片解析异常不阻断整流
         }
       },
       handler: (handlerResult) => {
         finish(query, ctx, handlerResult);
       },
     });
-    finish(query, ctx, result);
-  })().catch(err => {
+  } catch (err) {
     finish(query, ctx, { error: err });
-  });
+  }
 }
 
 /**
- * 验证配置是否有效
- * Bob 会在服务配置页展示「验证」按钮，点击后调用此函数
+ * 自定义验证函数
  */
 function pluginValidate(completion) {
   const configError = validateOptions();
@@ -524,7 +411,6 @@ function pluginValidate(completion) {
     "Authorization": `Bearer ${$option.apiKey}`,
   };
 
-  // 用 blocking 模式快速验证连通性和鉴权
   const body = buildRequestBody("hi", "blocking");
   body.user = "bob-plugin-validate";
 
@@ -540,13 +426,13 @@ function pluginValidate(completion) {
             result: false,
             error: { message: `网络请求失败：${result.error.localizedDescription || "请检查 API 地址是否可达"}` }
           });
-        } else if (result.response.statusCode === 401 || result.response.statusCode === 403) {
+        } else if (result.response && (result.response.statusCode === 401 || result.response.statusCode === 403)) {
           completion({
             result: false,
             error: { message: "API 密钥无效，请检查后重试。" }
           });
-        } else if (result.response.statusCode >= 400) {
-          const detail = result.data?.detail || result.data?.message || `HTTP ${result.response.statusCode}`;
+        } else if (result.response && result.response.statusCode >= 400) {
+          const detail = (result.data && (result.data.detail || result.data.message)) || `HTTP ${result.response.statusCode}`;
           completion({
             result: false,
             error: { message: `请求失败：${detail}` }
@@ -559,7 +445,7 @@ function pluginValidate(completion) {
   })().catch(err => {
     completion({
       result: false,
-      error: { message: err._message || "验证过程发生未知错误" }
+      error: { message: (err && (err._message || err.message)) || "验证过程发生未知错误" }
     });
   });
 }

@@ -1,13 +1,13 @@
 {
   "identifier": "dify.0.7.0",
-  "version": "0.8.0",
+  "version": "0.8.4",
   "category": "translate",
   "name": "ConnectDify",
   "summary": "Connect to Dify Chatflow / Workflow.",
   "author": "Wong",
   "homepage": "",
   "appcast": "",
-  "minBobVersion": "1.15.0",
+  "minBobVersion": "1.21.0",
   "options": [
     {
       "identifier": "appType",
